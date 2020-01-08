@@ -1,7 +1,9 @@
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Pipe
 from craigslist import CraigslistForSale
+from bs4 import BeautifulSoup
 import time
 import math
+import requests
 
 sitesHold = ["sfbay", "seattle", "newyork", "boston", "losangeles", "sandiego", "portland", "washingtondc",
              "chicago", "sacramento", "denver", "atlanta", "austin", "vancouver", "philadelphia", "phoenix",
@@ -74,22 +76,21 @@ sitesHold = ["sfbay", "seattle", "newyork", "boston", "losangeles", "sandiego", 
 results = []
 
 
-def f(sites, category, search_keys, queue):
+def f(sites, category, search_keys, conn):
     local_results = []
     for site in sites:
         cl_fs = CraigslistForSale(site=site, category=category, filters={'query': search_keys})
         for result in cl_fs.get_results(sort_by='newest'):
             local_results.append(result)
-    if len(local_results) > 0:
-        print(local_results)
-    queue.put(local_results)
+    conn.send(local_results)
+    conn.close()
 
 
 def scan_handler(event, context):
     started_at = time.monotonic()
-    queue = Queue()
     print("Running...")
-    amount_of_lists = int(event['amountOfLists'])
+    parent_conn, child_conn = Pipe()
+    amount_of_lists = int(event['amount_of_lists'])
     list_length = int(len(sitesHold) / amount_of_lists)
     extra_lists = math.ceil((len(sitesHold) - (amount_of_lists * list_length)) / list_length)
     site_list = []
@@ -101,24 +102,41 @@ def scan_handler(event, context):
     processes = []
     for i in range(len(site_list)):
         site_counter = site_counter + len(site_list[i])
-        processes.append(Process(target=f, args=(site_list[i], event['category'], event['searchQuery'], queue,)))
+        processes.append(Process(target=f, args=(site_list[i], event['category'], event['search_query'], child_conn,)))
 
     for process in processes:
         process.start()
 
     for process in processes:
-        listings = queue.get()
+        listings = parent_conn.recv()
         if len(listings) > 0:
             for listing in listings:
                 results.append(listing)
 
-    print(f"Results: {results}")
-
     for process in processes:
         process.join()
 
+    listings = []
+    for listing in results:
+        if listing['has_image'] == True:
+            r = requests.get(listing['url'])
+            soup = BeautifulSoup(r.content, features="html.parser")
+            image_link = soup.find("div", {"class": "slide first visible"}).img["src"]
+        else:
+            image_link = ""
+        listings.append({"id": listing['id'], "title": listing['name'], "link": listing['url'],
+                         "post_date": listing['last_updated'], "price": listing['price'].replace("$", ""),
+                         "photo": image_link, "has_image": listing['has_image']})
+
     total_time_took = time.monotonic() - started_at
+    print(f"Results: {listings}")
+    print(f"Amount of Results: {len(results)}")
     print(f"Sites processed: {site_counter}")
     print(f'Took {total_time_took} seconds long')
 
-
+    response = {
+        "statusCode": 200,
+        "headers": {},
+        "body": listings
+    }
+    return response
